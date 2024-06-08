@@ -3,13 +3,6 @@
 version = 3
 
 [[package]]
-name = "play-rust"
-version = "0.1.0"
-dependencies = [
- "thiserror",
-]
-
-[[package]]
 name = "proc-macro2"
 version = "1.0.85"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -56,6 +49,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "ujson"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]
