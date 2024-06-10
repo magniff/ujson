@@ -6,16 +6,16 @@ struct State {
 }
 
 #[derive(Debug, Clone, Copy, thiserror::Error, PartialEq, Eq)]
-enum ParserError {
+pub enum ParserError {
     #[error("Parse error at position {0}")]
     NoParse(usize),
 }
 
-struct Parser<'input, R> {
-    inner: Box<dyn FnOnce(&'input str, State) -> Result<(R, State), ParserError> + 'input>,
+pub struct Parser<'input, R> {
+    inner: Box<dyn Fn(&'input str, State) -> Result<(R, State), ParserError> + 'input>,
 }
 
-fn pattern<'input, 'pattern>(p: &'pattern str) -> Parser<'input, &'input str>
+fn pat<'input, 'pattern>(p: &'pattern str) -> Parser<'input, &'input str>
 where
     'pattern: 'input,
 {
@@ -35,6 +35,17 @@ where
     }
 }
 
+fn pat_ws<'input, 'pattern>(p: &'pattern str) -> Parser<'input, &'input str>
+where
+    'pattern: 'input,
+{
+    bind(take_while(|c| c.is_whitespace()), move |_: &str| {
+        bind(pat(p), move |s| {
+            bind(take_while(|c| c.is_whitespace()), move |_: &str| success(s))
+        })
+    })
+}
+
 fn or<'input, R: 'input>(first: Parser<'input, R>, second: Parser<'input, R>) -> Parser<'input, R> {
     Parser {
         inner: Box::new(
@@ -49,11 +60,12 @@ fn or<'input, R: 'input>(first: Parser<'input, R>, second: Parser<'input, R>) ->
 fn take_while<'input>(pred: impl Fn(char) -> bool + 'input) -> Parser<'input, &'input str> {
     Parser {
         inner: Box::new(move |input: &str, state| {
-            let mut current = state.current;
-            while current < input.len() && pred(input.chars().nth(current).unwrap()) {
-                current += 1;
-            }
-            Ok((&input[state.current..current], State { current }))
+            let end = input[state.current..]
+                .char_indices()
+                .take_while(|(_, c)| pred(*c))
+                .last()
+                .map_or(state.current, |(index, _)| state.current + index + 1);
+            Ok((&input[state.current..end], State { current: end }))
         }),
     }
 }
@@ -70,13 +82,13 @@ fn bind<'input, R: 'input, RR: 'input>(
     }
 }
 
-fn pure<'input, R: 'input>(value: R) -> Parser<'input, R> {
+fn success<'input, R: Clone + 'input>(value: R) -> Parser<'input, R> {
     Parser {
-        inner: Box::new(move |_: &'input str, state| Ok((value, state))),
+        inner: Box::new(move |_: &'input str, state| Ok((value.clone(), state))),
     }
 }
 
-fn pure_fail<'input, R: 'input>(unwind: Option<usize>) -> Parser<'input, R> {
+fn fail<'input, R: 'input>(unwind: Option<usize>) -> Parser<'input, R> {
     Parser {
         inner: Box::new(move |_: &'input str, state| {
             Err(ParserError::NoParse(
@@ -87,9 +99,9 @@ fn pure_fail<'input, R: 'input>(unwind: Option<usize>) -> Parser<'input, R> {
 }
 
 fn string<'input>() -> Parser<'input, JsonValue<'input>> {
-    bind(pattern("\""), |_: &str| {
+    bind(pat("\""), |_: &str| {
         bind(take_while(|c| c != '"'), |s| {
-            bind(pattern("\""), move |_: &str| pure(JsonValue::String(s)))
+            bind(pat("\""), move |_: &str| success(JsonValue::String(s)))
         })
     })
 }
@@ -101,24 +113,22 @@ fn merge_two_consecutive_strs<'input>(s1: &'input str, s2: &'input str) -> &'inp
 }
 
 fn whole_part_number<'input>() -> Parser<'input, &'input str> {
-    bind(or(pattern("-"), pattern("")), |sign| {
+    bind(or(pat("-"), pat("")), |sign| {
         bind(take_while(|c| c.is_digit(10)), |digits| {
             match digits.len() {
-                0 => pure_fail(Some(sign.len())),
-                1 => pure(merge_two_consecutive_strs(sign, digits)),
-                other if digits.chars().nth(0).unwrap() == '0' => {
-                    pure_fail(Some(other + sign.len()))
-                }
-                _ => pure(merge_two_consecutive_strs(sign, digits)),
+                0 => fail(Some(sign.len())),
+                1 => success(merge_two_consecutive_strs(sign, digits)),
+                other if digits.chars().nth(0).unwrap() == '0' => fail(Some(other + sign.len())),
+                _ => success(merge_two_consecutive_strs(sign, digits)),
             }
         })
     })
 }
 
 fn decimal_part_number<'input>() -> Parser<'input, &'input str> {
-    bind(pattern("."), |dot: &str| {
+    bind(pat("."), |dot: &str| {
         bind(take_while(|c| c.is_digit(10)), |digits| {
-            pure(merge_two_consecutive_strs(dot, digits))
+            success(merge_two_consecutive_strs(dot, digits))
         })
     })
 }
@@ -134,17 +144,88 @@ fn optional<'input, R: 'input>(parser: Parser<'input, R>) -> Parser<'input, Opti
     }
 }
 
+fn spaced_by<'input, R: 'input, S: 'input>(
+    parser: Parser<'input, R>,
+    spacer: Parser<'input, S>,
+) -> Parser<'input, Vec<R>> {
+    Parser {
+        inner: Box::new(move |input: &'input str, state| {
+            let mut results = Vec::with_capacity(8);
+            let (first_result, mut state) = (parser.inner)(input, state)?;
+            results.push(first_result);
+
+            while let Ok((_, new_state)) = (spacer.inner)(input, state) {
+                match (parser.inner)(input, new_state) {
+                    Ok((result, new_state)) => {
+                        results.push(result);
+                        state = new_state;
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            Ok((results, state))
+        }),
+    }
+}
+
+fn json_value<'input>() -> Parser<'input, JsonValue<'input>> {
+    or(
+        string(),
+        or(
+            number(),
+            or(object(), or(list(), or(boolean(), or(null(), fail(None))))),
+        ),
+    )
+}
+
+fn key_value_pair<'input>() -> Parser<'input, (&'input str, JsonValue<'input>)> {
+    bind(string(), move |key| {
+        bind(pat_ws(":"), move |_: &str| {
+            let JsonValue::String(key) = key else {
+                panic!("internal error in key_value_pair, key is not a string")
+            };
+            bind(json_value(), move |value| success((key, value)))
+        })
+    })
+}
+
+fn object<'input>() -> Parser<'input, JsonValue<'input>> {
+    bind(pat_ws("{"), |_: &str| {
+        bind(
+            spaced_by(key_value_pair(), pat_ws(",")),
+            move |key_value_pairs| {
+                let key_value_pairs = std::rc::Rc::new(key_value_pairs);
+                bind(pat_ws("}"), move |_: &str| {
+                    success(JsonValue::Object(key_value_pairs.clone()))
+                })
+            },
+        )
+    })
+}
+
+fn list<'input>() -> Parser<'input, JsonValue<'input>> {
+    bind(pat_ws("["), |_: &str| {
+        bind(spaced_by(json_value(), pat_ws(",")), move |values| {
+            let values = std::rc::Rc::new(values);
+            bind(pat_ws("]"), move |_: &str| {
+                success(JsonValue::List(values.clone()))
+            })
+        })
+    })
+}
+
 fn number<'input>() -> Parser<'input, JsonValue<'input>> {
     bind(whole_part_number(), |whole_part| {
         bind(
             optional(decimal_part_number()),
             move |decimal_part| match decimal_part {
-                Some(decimal_part) => pure(JsonValue::Number(
+                Some(decimal_part) => success(JsonValue::Number(
                     merge_two_consecutive_strs(whole_part, decimal_part)
                         .parse::<f64>()
                         .unwrap(),
                 )),
-                None => pure(JsonValue::Number(whole_part.parse::<f64>().unwrap())),
+                None => success(JsonValue::Number(whole_part.parse::<f64>().unwrap())),
             },
         )
     })
@@ -152,32 +233,43 @@ fn number<'input>() -> Parser<'input, JsonValue<'input>> {
 
 fn boolean<'input>() -> Parser<'input, JsonValue<'input>> {
     or(
-        bind(pattern("true"), |_| pure(JsonValue::Boolean(true))),
-        bind(pattern("false"), |_| pure(JsonValue::Boolean(false))),
+        bind(pat("true"), |_| success(JsonValue::Boolean(true))),
+        bind(pat("false"), |_| success(JsonValue::Boolean(false))),
     )
 }
 
 fn null<'input>() -> Parser<'input, JsonValue<'input>> {
-    bind(pattern("null"), |_| pure(JsonValue::Null))
+    bind(pat("null"), |_| success(JsonValue::Null))
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum JsonValue<'input> {
+pub enum JsonValue<'input> {
     String(&'input str),
     Number(f64),
-    Object(std::collections::HashMap<&'input str, JsonValue<'input>>),
-    List(Vec<JsonValue<'input>>),
+    Object(std::rc::Rc<Vec<(&'input str, JsonValue<'input>)>>),
+    List(std::rc::Rc<Vec<JsonValue<'input>>>),
     Boolean(bool),
     Null,
 }
 
+pub fn from_str<'input>(input: &'input str) -> Result<JsonValue<'input>, ParserError> {
+    let state = State { current: 0 };
+    let (result, state) = (json_value().inner)(input, state)?;
+    if state.current == input.len() {
+        Ok(result)
+    } else {
+        Err(ParserError::NoParse(state.current))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     // test the pattern function
     #[test]
     fn test_pattern() {
-        let parser = pattern("hello");
+        let parser = pat("hello");
         let input = "hello world";
         let state = State { current: 0 };
         let result = (parser.inner)(input, state).unwrap();
@@ -187,7 +279,7 @@ mod tests {
     // test the or function
     #[test]
     fn test_or() {
-        let parser = or(pattern("hello"), pattern("world"));
+        let parser = or(pat("hello"), pat("world"));
         let input = "world";
         let state = State { current: 0 };
         let result = (parser.inner)(input, state).unwrap();
@@ -207,7 +299,7 @@ mod tests {
     // test the pure function
     #[test]
     fn test_pure() {
-        let parser = pure("hello");
+        let parser = success("hello");
         let input = "world";
         let state = State { current: 0 };
         let result = (parser.inner)(input, state).unwrap();
@@ -217,7 +309,7 @@ mod tests {
     // test the bind parser using the pure parser
     #[test]
     fn test_bind() {
-        let parser = bind(pattern("hello"), |s| pure(s.to_uppercase()));
+        let parser = bind(pat("hello"), |s| success(s.to_uppercase()));
         let input = "hello world";
         let state = State { current: 0 };
         let result = (parser.inner)(input, state).unwrap();
@@ -259,13 +351,13 @@ mod tests {
     // test the pure fail parser
     #[test]
     fn test_pure_fail() {
-        let parser = pure_fail::<i64>(None);
+        let parser = fail::<i64>(None);
         let input = "hello world";
         let state = State { current: 0 };
         let result = (parser.inner)(input, state).unwrap_err();
         assert_eq!(result, ParserError::NoParse(0));
 
-        let parser = pure_fail::<i64>(Some(2));
+        let parser = fail::<i64>(Some(2));
         let input = "hello world";
         let state = State { current: 2 };
         let result = (parser.inner)(input, state).unwrap_err();
@@ -340,5 +432,65 @@ mod tests {
         let state = State { current: 0 };
         let result = (parser.inner)(input, state).unwrap();
         assert_eq!(result, (JsonValue::Null, State { current: 4 }));
+    }
+
+    // test the json value parser
+    #[test]
+    fn test_json_value() {
+        let parser = json_value();
+        let input = "\"hello\"";
+        let state = State { current: 0 };
+        let result = (parser.inner)(input, state).unwrap();
+        assert_eq!(result, (JsonValue::String("hello"), State { current: 7 }));
+
+        let parser = json_value();
+        let input = "123";
+        let state = State { current: 0 };
+        let result = (parser.inner)(input, state).unwrap();
+        assert_eq!(result, (JsonValue::Number(123.0), State { current: 3 }));
+
+        let parser = json_value();
+        let input = "true";
+        let state = State { current: 0 };
+        let result = (parser.inner)(input, state).unwrap();
+        assert_eq!(result, (JsonValue::Boolean(true), State { current: 4 }));
+
+        let parser = json_value();
+        let input = "null";
+        let state = State { current: 0 };
+        let result = (parser.inner)(input, state).unwrap();
+        assert_eq!(result, (JsonValue::Null, State { current: 4 }));
+
+        let parser = json_value();
+        let input = "[1, 2, 3]";
+        let state = State { current: 0 };
+        let result = (parser.inner)(input, state).unwrap();
+        assert_eq!(
+            result,
+            (
+                JsonValue::List(std::rc::Rc::new(vec![
+                    JsonValue::Number(1.0),
+                    JsonValue::Number(2.0),
+                    JsonValue::Number(3.0)
+                ])),
+                State {
+                    current: input.len()
+                }
+            )
+        );
+
+        let parser = json_value();
+        let input = "{\"key\": \"value\"}";
+        let state = State { current: 0 };
+        let result = (parser.inner)(input, state).unwrap();
+        assert_eq!(
+            result,
+            (
+                JsonValue::Object(std::rc::Rc::new(vec![("key", JsonValue::String("value"))])),
+                State {
+                    current: input.len()
+                }
+            )
+        );
     }
 }
