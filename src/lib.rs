@@ -11,31 +11,39 @@ pub enum ParserError {
     NoParse(usize),
 }
 
-pub struct Parser<'input, R> {
-    inner: Box<dyn Fn(&'input str, State) -> Result<(R, State), ParserError> + 'input>,
+trait Parser<'input, R> {
+    fn parse(&self, input: &'input str, state: State) -> Result<(R, State), ParserError>;
 }
 
-fn pat<'input, 'pattern>(p: &'pattern str) -> Parser<'input, &'input str>
+impl<'input, R, F> Parser<'input, R> for F
 where
-    'pattern: 'input,
+    F: Fn(&'input str, State) -> Result<(R, State), ParserError> + 'input,
 {
-    Parser {
-        inner: Box::new(move |input: &'input str, state| {
-            if input[state.current..].starts_with(p) {
-                Ok((
-                    &input[state.current..state.current + p.len()],
-                    State {
-                        current: state.current + p.len(),
-                    },
-                ))
-            } else {
-                Err(ParserError::NoParse(state.current))
-            }
-        }),
+    #[inline(always)]
+    fn parse(&self, input: &'input str, state: State) -> Result<(R, State), ParserError> {
+        self(input, state)
     }
 }
 
-fn pat_ws<'input, 'pattern>(p: &'pattern str) -> Parser<'input, &'input str>
+fn pat<'input, 'pattern>(p: &'pattern str) -> impl Parser<'input, &'input str>
+where
+    'pattern: 'input,
+{
+    move |input: &'input str, state: State| {
+        if input[state.current..].starts_with(p) {
+            Ok((
+                &input[state.current..state.current + p.len()],
+                State {
+                    current: state.current + p.len(),
+                },
+            ))
+        } else {
+            Err(ParserError::NoParse(state.current))
+        }
+    }
+}
+
+fn pat_ws<'input, 'pattern>(p: &'pattern str) -> impl Parser<'input, &'input str>
 where
     'pattern: 'input,
 {
@@ -46,59 +54,55 @@ where
     })
 }
 
-fn or<'input, R: 'input>(first: Parser<'input, R>, second: Parser<'input, R>) -> Parser<'input, R> {
-    Parser {
-        inner: Box::new(
-            move |input: &'input str, state| match (first.inner)(input, state) {
-                Ok(result) => Ok(result),
-                Err(_) => (second.inner)(input, state),
-            },
-        ),
+fn or<'input, R: 'input>(
+    first: impl Parser<'input, R> + 'input,
+    second: impl Parser<'input, R> + 'input,
+) -> impl Parser<'input, R> + 'input {
+    move |input: &'input str, state| match first.parse(input, state) {
+        Ok(result) => Ok(result),
+        Err(_) => second.parse(input, state),
     }
 }
 
-fn take_while<'input>(pred: impl Fn(char) -> bool + 'input) -> Parser<'input, &'input str> {
-    Parser {
-        inner: Box::new(move |input: &str, state| {
-            let end = input[state.current..]
-                .char_indices()
-                .take_while(|(_, c)| pred(*c))
-                .last()
-                .map_or(state.current, |(index, _)| state.current + index + 1);
-            Ok((&input[state.current..end], State { current: end }))
-        }),
+fn take_while<'input>(
+    pred: impl Fn(char) -> bool + 'input,
+) -> impl Parser<'input, &'input str> + 'input {
+    move |input: &'input str, state: State| {
+        let end = input[state.current..]
+            .char_indices()
+            .take_while(|(_, c)| pred(*c))
+            .last()
+            .map_or(state.current, |(index, _)| state.current + index + 1);
+        Ok((&input[state.current..end], State { current: end }))
     }
 }
 
-fn bind<'input, R: 'input, RR: 'input>(
-    p: Parser<'input, R>,
-    f: impl Fn(R) -> Parser<'input, RR> + 'input,
-) -> Parser<'input, RR> {
-    Parser {
-        inner: Box::new(move |input: &'input str, state| {
-            let (result, new_state) = (p.inner)(input, state)?;
-            (f(result).inner)(input, new_state)
-        }),
+fn bind<'input, R: 'input, RR: 'input, P>(
+    p: impl Parser<'input, R> + 'input,
+    f: impl Fn(R) -> P + 'input,
+) -> impl Parser<'input, RR>
+where
+    P: Parser<'input, RR> + 'input,
+{
+    move |input: &'input str, state| {
+        let (result, new_state) = p.parse(input, state)?;
+        f(result).parse(input, new_state)
     }
 }
 
-fn success<'input, R: Clone + 'input>(value: R) -> Parser<'input, R> {
-    Parser {
-        inner: Box::new(move |_: &'input str, state| Ok((value.clone(), state))),
+fn success<'input, R: Clone + 'input>(value: R) -> impl Parser<'input, R> {
+    move |_: &'input str, state| Ok((value.clone(), state))
+}
+
+fn fail<'input, R: 'input>(unwind: Option<usize>) -> impl Parser<'input, R> {
+    move |_: &'input str, state: State| {
+        Err(ParserError::NoParse(
+            unwind.map_or(state.current, |u| state.current - u),
+        ))
     }
 }
 
-fn fail<'input, R: 'input>(unwind: Option<usize>) -> Parser<'input, R> {
-    Parser {
-        inner: Box::new(move |_: &'input str, state| {
-            Err(ParserError::NoParse(
-                unwind.map_or(state.current, |u| state.current - u),
-            ))
-        }),
-    }
-}
-
-fn string<'input>() -> Parser<'input, JsonValue<'input>> {
+fn string<'input>() -> impl Parser<'input, JsonValue<'input>> {
     bind(pat("\""), |_: &str| {
         bind(take_while(|c| c != '"'), |s| {
             bind(pat("\""), move |_: &str| success(JsonValue::String(s)))
@@ -112,20 +116,47 @@ fn merge_two_consecutive_strs<'input>(s1: &'input str, s2: &'input str) -> &'inp
     }
 }
 
-fn whole_part_number<'input>() -> Parser<'input, &'input str> {
+enum Either<A, B, C, D> {
+    A(A),
+    B(B),
+    C(C),
+    D(D),
+}
+
+impl<'input, A, B, C, D, R> Parser<'input, R> for Either<A, B, C, D>
+where
+    A: Parser<'input, R>,
+    B: Parser<'input, R>,
+    C: Parser<'input, R>,
+    D: Parser<'input, R>,
+{
+    #[inline(always)]
+    fn parse(&self, input: &'input str, state: State) -> Result<(R, State), ParserError> {
+        match self {
+            Either::A(a) => a.parse(input, state),
+            Either::B(b) => b.parse(input, state),
+            Either::C(c) => c.parse(input, state),
+            Either::D(d) => d.parse(input, state),
+        }
+    }
+}
+
+fn whole_part_number<'input>() -> impl Parser<'input, &'input str> {
     bind(or(pat("-"), pat("")), |sign| {
         bind(take_while(|c| c.is_digit(10)), |digits| {
             match digits.len() {
-                0 => fail(Some(sign.len())),
-                1 => success(merge_two_consecutive_strs(sign, digits)),
-                other if digits.chars().nth(0).unwrap() == '0' => fail(Some(other + sign.len())),
-                _ => success(merge_two_consecutive_strs(sign, digits)),
+                0 => Either::A(fail(Some(sign.len()))),
+                1 => Either::B(success(merge_two_consecutive_strs(sign, digits))),
+                other if digits.chars().nth(0).unwrap() == '0' => {
+                    Either::C(fail(Some(other + sign.len())))
+                }
+                _ => Either::D(success(merge_two_consecutive_strs(sign, digits))),
             }
         })
     })
 }
 
-fn decimal_part_number<'input>() -> Parser<'input, &'input str> {
+fn decimal_part_number<'input>() -> impl Parser<'input, &'input str> {
     bind(pat("."), |dot: &str| {
         bind(take_while(|c| c.is_digit(10)), |digits| {
             success(merge_two_consecutive_strs(dot, digits))
@@ -133,53 +164,52 @@ fn decimal_part_number<'input>() -> Parser<'input, &'input str> {
     })
 }
 
-fn optional<'input, R: 'input>(parser: Parser<'input, R>) -> Parser<'input, Option<R>> {
-    Parser {
-        inner: Box::new(
-            move |input: &'input str, state| match (parser.inner)(input, state) {
-                Ok((result, new_state)) => Ok((Some(result), new_state)),
-                Err(_) => Ok((None, state)),
-            },
-        ),
+fn optional<'input, R: 'input>(
+    parser: impl Parser<'input, R> + 'input,
+) -> impl Parser<'input, Option<R>> {
+    move |input: &'input str, state| match parser.parse(input, state) {
+        Ok((result, new_state)) => Ok((Some(result), new_state)),
+        Err(_) => Ok((None, state)),
     }
 }
 
 fn spaced_by<'input, R: 'input, S: 'input>(
-    parser: Parser<'input, R>,
-    spacer: Parser<'input, S>,
-) -> Parser<'input, Vec<R>> {
-    Parser {
-        inner: Box::new(move |input: &'input str, state| {
-            let mut results = Vec::with_capacity(8);
-            let (first_result, mut state) = (parser.inner)(input, state)?;
-            results.push(first_result);
+    parser: impl Parser<'input, R> + 'input,
+    spacer: impl Parser<'input, S> + 'input,
+) -> impl Parser<'input, Vec<R>> + 'input {
+    move |input: &'input str, state| {
+        let mut results = Vec::new();
+        let (first_result, mut state) = parser.parse(input, state)?;
+        results.push(first_result);
 
-            while let Ok((_, new_state)) = (spacer.inner)(input, state) {
-                match (parser.inner)(input, new_state) {
-                    Ok((result, new_state)) => {
-                        results.push(result);
-                        state = new_state;
-                    }
-                    Err(_) => break,
+        while let Ok((_, new_state)) = spacer.parse(input, state) {
+            match parser.parse(input, new_state) {
+                Ok((result, new_state)) => {
+                    results.push(result);
+                    state = new_state;
                 }
+                Err(_) => break,
             }
+        }
 
-            Ok((results, state))
-        }),
+        Ok((results, state))
     }
 }
 
-fn json_value<'input>() -> Parser<'input, JsonValue<'input>> {
-    or(
-        string(),
+fn json_value<'input>() -> impl Parser<'input, JsonValue<'input>> {
+    move |input: &'input str, state| {
         or(
-            number(),
-            or(object(), or(list(), or(boolean(), or(null(), fail(None))))),
-        ),
-    )
+            string(),
+            or(
+                number(),
+                or(object(), or(list(), or(boolean(), or(null(), fail(None))))),
+            ),
+        )
+        .parse(input, state)
+    }
 }
 
-fn key_value_pair<'input>() -> Parser<'input, (&'input str, JsonValue<'input>)> {
+fn key_value_pair<'input>() -> impl Parser<'input, (&'input str, JsonValue<'input>)> {
     bind(string(), move |key| {
         bind(pat_ws(":"), move |_: &str| {
             let JsonValue::String(key) = key else {
@@ -190,7 +220,7 @@ fn key_value_pair<'input>() -> Parser<'input, (&'input str, JsonValue<'input>)> 
     })
 }
 
-fn object<'input>() -> Parser<'input, JsonValue<'input>> {
+fn object<'input>() -> impl Parser<'input, JsonValue<'input>> {
     bind(pat_ws("{"), |_: &str| {
         bind(
             spaced_by(key_value_pair(), pat_ws(",")),
@@ -204,7 +234,7 @@ fn object<'input>() -> Parser<'input, JsonValue<'input>> {
     })
 }
 
-fn list<'input>() -> Parser<'input, JsonValue<'input>> {
+fn list<'input>() -> impl Parser<'input, JsonValue<'input>> {
     bind(pat_ws("["), |_: &str| {
         bind(spaced_by(json_value(), pat_ws(",")), move |values| {
             let values = std::rc::Rc::new(values);
@@ -215,7 +245,7 @@ fn list<'input>() -> Parser<'input, JsonValue<'input>> {
     })
 }
 
-fn number<'input>() -> Parser<'input, JsonValue<'input>> {
+fn number<'input>() -> impl Parser<'input, JsonValue<'input>> {
     bind(whole_part_number(), |whole_part| {
         bind(
             optional(decimal_part_number()),
@@ -231,14 +261,14 @@ fn number<'input>() -> Parser<'input, JsonValue<'input>> {
     })
 }
 
-fn boolean<'input>() -> Parser<'input, JsonValue<'input>> {
+fn boolean<'input>() -> impl Parser<'input, JsonValue<'input>> {
     or(
         bind(pat("true"), |_| success(JsonValue::Boolean(true))),
         bind(pat("false"), |_| success(JsonValue::Boolean(false))),
     )
 }
 
-fn null<'input>() -> Parser<'input, JsonValue<'input>> {
+fn null<'input>() -> impl Parser<'input, JsonValue<'input>> {
     bind(pat("null"), |_| success(JsonValue::Null))
 }
 
@@ -254,7 +284,7 @@ pub enum JsonValue<'input> {
 
 pub fn from_str<'input>(input: &'input str) -> Result<JsonValue<'input>, ParserError> {
     let state = State { current: 0 };
-    let (result, state) = (json_value().inner)(input, state)?;
+    let (result, state) = json_value().parse(input, state)?;
     if state.current == input.len() {
         Ok(result)
     } else {
@@ -272,7 +302,7 @@ mod tests {
         let parser = pat("hello");
         let input = "hello world";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap();
+        let result = parser.parse(input, state).unwrap();
         assert_eq!(result, ("hello", State { current: 5 }));
     }
 
@@ -282,7 +312,7 @@ mod tests {
         let parser = or(pat("hello"), pat("world"));
         let input = "world";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap();
+        let result = parser.parse(input, state).unwrap();
         assert_eq!(result, ("world", State { current: 5 }));
     }
 
@@ -292,7 +322,7 @@ mod tests {
         let parser = take_while(|c| c.is_alphabetic());
         let input = "hello world";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap();
+        let result = parser.parse(input, state).unwrap();
         assert_eq!(result, ("hello", State { current: 5 }));
     }
 
@@ -302,7 +332,7 @@ mod tests {
         let parser = success("hello");
         let input = "world";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap();
+        let result = parser.parse(input, state).unwrap();
         assert_eq!(result, ("hello", State { current: 0 }));
     }
 
@@ -312,7 +342,7 @@ mod tests {
         let parser = bind(pat("hello"), |s| success(s.to_uppercase()));
         let input = "hello world";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap();
+        let result = parser.parse(input, state).unwrap();
         assert_eq!(result, ("HELLO".to_string(), State { current: 5 }));
     }
 
@@ -322,7 +352,7 @@ mod tests {
         let parser = string();
         let input = "\"hello\"";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap();
+        let result = parser.parse(input, state).unwrap();
         assert_eq!(result, (JsonValue::String("hello"), State { current: 7 }));
     }
 
@@ -332,19 +362,19 @@ mod tests {
         let parser = number();
         let input = "123";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap();
+        let result = parser.parse(input, state).unwrap();
         assert_eq!(result, (JsonValue::Number(123.0), State { current: 3 }));
 
         let parser = number();
         let input = "-123";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap();
+        let result = parser.parse(input, state).unwrap();
         assert_eq!(result, (JsonValue::Number(-123.0), State { current: 4 }));
 
         let parser = number();
         let input = "-00000000000001";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap_err();
+        let result = parser.parse(input, state).unwrap_err();
         assert_eq!(result, ParserError::NoParse(0));
     }
 
@@ -354,13 +384,13 @@ mod tests {
         let parser = fail::<i64>(None);
         let input = "hello world";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap_err();
+        let result = parser.parse(input, state).unwrap_err();
         assert_eq!(result, ParserError::NoParse(0));
 
         let parser = fail::<i64>(Some(2));
         let input = "hello world";
         let state = State { current: 2 };
-        let result = (parser.inner)(input, state).unwrap_err();
+        let result = parser.parse(input, state).unwrap_err();
         assert_eq!(result, ParserError::NoParse(0));
     }
 
@@ -370,25 +400,25 @@ mod tests {
         let parser = whole_part_number();
         let input = "123";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap();
+        let result = parser.parse(input, state).unwrap();
         assert_eq!(result, ("123", State { current: 3 }));
 
         let parser = whole_part_number();
         let input = "-123";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap();
+        let result = parser.parse(input, state).unwrap();
         assert_eq!(result, ("-123", State { current: 4 }));
 
         let parser = whole_part_number();
         let input = "0";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap();
+        let result = parser.parse(input, state).unwrap();
         assert_eq!(result, ("0", State { current: 1 }));
 
         let parser = whole_part_number();
         let input = "-00000000000001";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap_err();
+        let result = parser.parse(input, state).unwrap_err();
         assert_eq!(result, ParserError::NoParse(0));
     }
 
@@ -398,13 +428,13 @@ mod tests {
         let parser = decimal_part_number();
         let input = ".123";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap();
+        let result = parser.parse(input, state).unwrap();
         assert_eq!(result, (".123", State { current: 4 }));
 
         let parser = decimal_part_number();
         let input = ".00000000000001";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap();
+        let result = parser.parse(input, state).unwrap();
         assert_eq!(result, (".00000000000001", State { current: 15 }));
     }
 
@@ -414,13 +444,13 @@ mod tests {
         let parser = boolean();
         let input = "true";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap();
+        let result = parser.parse(input, state).unwrap();
         assert_eq!(result, (JsonValue::Boolean(true), State { current: 4 }));
 
         let parser = boolean();
         let input = "false";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap();
+        let result = parser.parse(input, state).unwrap();
         assert_eq!(result, (JsonValue::Boolean(false), State { current: 5 }));
     }
 
@@ -430,7 +460,7 @@ mod tests {
         let parser = null();
         let input = "null";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap();
+        let result = parser.parse(input, state).unwrap();
         assert_eq!(result, (JsonValue::Null, State { current: 4 }));
     }
 
@@ -440,31 +470,31 @@ mod tests {
         let parser = json_value();
         let input = "\"hello\"";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap();
+        let result = parser.parse(input, state).unwrap();
         assert_eq!(result, (JsonValue::String("hello"), State { current: 7 }));
 
         let parser = json_value();
         let input = "123";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap();
+        let result = parser.parse(input, state).unwrap();
         assert_eq!(result, (JsonValue::Number(123.0), State { current: 3 }));
 
         let parser = json_value();
         let input = "true";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap();
+        let result = parser.parse(input, state).unwrap();
         assert_eq!(result, (JsonValue::Boolean(true), State { current: 4 }));
 
         let parser = json_value();
         let input = "null";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap();
+        let result = parser.parse(input, state).unwrap();
         assert_eq!(result, (JsonValue::Null, State { current: 4 }));
 
         let parser = json_value();
         let input = "[1, 2, 3]";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap();
+        let result = parser.parse(input, state).unwrap();
         assert_eq!(
             result,
             (
@@ -482,7 +512,7 @@ mod tests {
         let parser = json_value();
         let input = "{\"key\": \"value\"}";
         let state = State { current: 0 };
-        let result = (parser.inner)(input, state).unwrap();
+        let result = parser.parse(input, state).unwrap();
         assert_eq!(
             result,
             (
