@@ -29,6 +29,7 @@ fn pat<'input, 'pattern>(p: &'pattern str) -> impl Parser<'input, &'input str>
 where
     'pattern: 'input,
 {
+    #[inline]
     move |input: &'input str, state: State| {
         if input[state.current..].starts_with(p) {
             Ok((
@@ -47,17 +48,22 @@ fn pat_ws<'input, 'pattern>(p: &'pattern str) -> impl Parser<'input, &'input str
 where
     'pattern: 'input,
 {
-    bind(take_while(|c| c.is_whitespace()), move |_: &str| {
-        bind(pat(p), move |s| {
-            bind(take_while(|c| c.is_whitespace()), move |_: &str| success(s))
-        })
-    })
+    bind(
+        take_while(|c| c.is_whitespace()),
+        #[inline]
+        move |_: &str| {
+            bind(pat(p), move |s| {
+                bind(take_while(|c| c.is_whitespace()), move |_: &str| success(s))
+            })
+        },
+    )
 }
 
 fn or<'input, R: 'input>(
     first: impl Parser<'input, R> + 'input,
     second: impl Parser<'input, R> + 'input,
 ) -> impl Parser<'input, R> + 'input {
+    #[inline]
     move |input: &'input str, state| match first.parse(input, state) {
         Ok(result) => Ok(result),
         Err(_) => second.parse(input, state),
@@ -67,6 +73,7 @@ fn or<'input, R: 'input>(
 fn take_while<'input>(
     pred: impl Fn(char) -> bool + 'input,
 ) -> impl Parser<'input, &'input str> + 'input {
+    #[inline]
     move |input: &'input str, state: State| {
         let end = input[state.current..]
             .char_indices()
@@ -84,6 +91,7 @@ fn bind<'input, R: 'input, RR: 'input, P>(
 where
     P: Parser<'input, RR> + 'input,
 {
+    #[inline]
     move |input: &'input str, state| {
         let (result, new_state) = p.parse(input, state)?;
         f(result).parse(input, new_state)
@@ -91,10 +99,12 @@ where
 }
 
 fn success<'input, R: Clone + 'input>(value: R) -> impl Parser<'input, R> {
+    #[inline]
     move |_: &'input str, state| Ok((value.clone(), state))
 }
 
 fn fail<'input, R: 'input>(unwind: Option<usize>) -> impl Parser<'input, R> {
+    #[inline]
     move |_: &'input str, state: State| {
         Err(ParserError::NoParse(
             unwind.map_or(state.current, |u| state.current - u),
@@ -103,11 +113,23 @@ fn fail<'input, R: 'input>(unwind: Option<usize>) -> impl Parser<'input, R> {
 }
 
 fn string<'input>() -> impl Parser<'input, JsonValue<'input>> {
-    bind(pat("\""), |_: &str| {
-        bind(take_while(|c| c != '"'), |s| {
-            bind(pat("\""), move |_: &str| success(JsonValue::String(s)))
-        })
-    })
+    bind(
+        pat("\""),
+        #[inline]
+        |_: &str| {
+            bind(
+                take_while(|c| c != '"'),
+                #[inline]
+                |s| {
+                    bind(
+                        pat("\""),
+                        #[inline]
+                        move |_: &str| success(JsonValue::String(s)),
+                    )
+                },
+            )
+        },
+    )
 }
 
 fn merge_two_consecutive_strs<'input>(s1: &'input str, s2: &'input str) -> &'input str {
@@ -142,18 +164,24 @@ where
 }
 
 fn whole_part_number<'input>() -> impl Parser<'input, &'input str> {
-    bind(or(pat("-"), pat("")), |sign| {
-        bind(take_while(|c| c.is_digit(10)), |digits| {
-            match digits.len() {
-                0 => Either::A(fail(Some(sign.len()))),
-                1 => Either::B(success(merge_two_consecutive_strs(sign, digits))),
-                other if digits.chars().nth(0).unwrap() == '0' => {
-                    Either::C(fail(Some(other + sign.len())))
-                }
-                _ => Either::D(success(merge_two_consecutive_strs(sign, digits))),
-            }
-        })
-    })
+    bind(
+        or(pat("-"), pat("")),
+        #[inline]
+        |sign| {
+            bind(
+                take_while(|c| c.is_digit(10)),
+                #[inline]
+                |digits| match digits.len() {
+                    0 => Either::A(fail(Some(sign.len()))),
+                    1 => Either::B(success(merge_two_consecutive_strs(sign, digits))),
+                    other if digits.chars().nth(0).unwrap() == '0' => {
+                        Either::C(fail(Some(other + sign.len())))
+                    }
+                    _ => Either::D(success(merge_two_consecutive_strs(sign, digits))),
+                },
+            )
+        },
+    )
 }
 
 fn decimal_part_number<'input>() -> impl Parser<'input, &'input str> {
@@ -167,6 +195,7 @@ fn decimal_part_number<'input>() -> impl Parser<'input, &'input str> {
 fn optional<'input, R: 'input>(
     parser: impl Parser<'input, R> + 'input,
 ) -> impl Parser<'input, Option<R>> {
+    #[inline]
     move |input: &'input str, state| match parser.parse(input, state) {
         Ok((result, new_state)) => Ok((Some(result), new_state)),
         Err(_) => Ok((None, state)),
@@ -177,6 +206,7 @@ fn spaced_by<'input, R: 'input, S: 'input>(
     parser: impl Parser<'input, R> + 'input,
     spacer: impl Parser<'input, S> + 'input,
 ) -> impl Parser<'input, Vec<R>> + 'input {
+    #[inline]
     move |input: &'input str, state| {
         let mut results = Vec::new();
         let (first_result, mut state) = parser.parse(input, state)?;
@@ -225,9 +255,9 @@ fn object<'input>() -> impl Parser<'input, JsonValue<'input>> {
         bind(
             spaced_by(key_value_pair(), pat_ws(",")),
             move |key_value_pairs| {
-                let key_value_pairs = std::rc::Rc::new(key_value_pairs);
+                let key_value_pairs: std::rc::Rc<_> = std::rc::Rc::from(key_value_pairs);
                 bind(pat_ws("}"), move |_: &str| {
-                    success(JsonValue::Object(key_value_pairs.clone()))
+                    success(JsonValue::Object(std::rc::Rc::clone(&key_value_pairs)))
                 })
             },
         )
@@ -237,9 +267,9 @@ fn object<'input>() -> impl Parser<'input, JsonValue<'input>> {
 fn list<'input>() -> impl Parser<'input, JsonValue<'input>> {
     bind(pat_ws("["), |_: &str| {
         bind(spaced_by(json_value(), pat_ws(",")), move |values| {
-            let values = std::rc::Rc::new(values);
+            let values: std::rc::Rc<_> = std::rc::Rc::from(values);
             bind(pat_ws("]"), move |_: &str| {
-                success(JsonValue::List(values.clone()))
+                success(JsonValue::List(std::rc::Rc::clone(&values)))
             })
         })
     })
@@ -263,8 +293,16 @@ fn number<'input>() -> impl Parser<'input, JsonValue<'input>> {
 
 fn boolean<'input>() -> impl Parser<'input, JsonValue<'input>> {
     or(
-        bind(pat("true"), |_| success(JsonValue::Boolean(true))),
-        bind(pat("false"), |_| success(JsonValue::Boolean(false))),
+        bind(
+            pat("true"),
+            #[inline]
+            |_| success(JsonValue::Boolean(true)),
+        ),
+        bind(
+            pat("false"),
+            #[inline]
+            |_| success(JsonValue::Boolean(false)),
+        ),
     )
 }
 
@@ -276,8 +314,8 @@ fn null<'input>() -> impl Parser<'input, JsonValue<'input>> {
 pub enum JsonValue<'input> {
     String(&'input str),
     Number(f64),
-    Object(std::rc::Rc<Vec<(&'input str, JsonValue<'input>)>>),
-    List(std::rc::Rc<Vec<JsonValue<'input>>>),
+    Object(std::rc::Rc<[(&'input str, JsonValue<'input>)]>),
+    List(std::rc::Rc<[JsonValue<'input>]>),
     Boolean(bool),
     Null,
 }
@@ -498,7 +536,7 @@ mod tests {
         assert_eq!(
             result,
             (
-                JsonValue::List(std::rc::Rc::new(vec![
+                JsonValue::List(std::rc::Rc::from(vec![
                     JsonValue::Number(1.0),
                     JsonValue::Number(2.0),
                     JsonValue::Number(3.0)
@@ -516,7 +554,7 @@ mod tests {
         assert_eq!(
             result,
             (
-                JsonValue::Object(std::rc::Rc::new(vec![("key", JsonValue::String("value"))])),
+                JsonValue::Object(std::rc::Rc::from(vec![("key", JsonValue::String("value"))])),
                 State {
                     current: input.len()
                 }
