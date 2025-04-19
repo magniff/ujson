@@ -1,4 +1,4 @@
-# ujson
+# μjson
 
 A simple, yet performant json parser implementaion based on parser combinators approach.
 
