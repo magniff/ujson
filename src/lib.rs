@@ -19,7 +19,7 @@ impl<'input, R, F> Parser<'input, R> for F
 where
     F: Fn(&'input str, State) -> Result<(R, State), ParserError> + 'input,
 {
-    #[inline(always)]
+    #[inline]
     fn parse(&self, input: &'input str, state: State) -> Result<(R, State), ParserError> {
         self(input, state)
     }
@@ -229,9 +229,9 @@ fn spaced_by<'input, R: 'input, S: 'input>(
 fn json_value<'input>() -> impl Parser<'input, JsonValue<'input>> {
     move |input: &'input str, state| {
         or(
-            string(),
+            number(),
             or(
-                number(),
+                string(),
                 or(object(), or(list(), or(boolean(), or(null(), fail(None))))),
             ),
         )
